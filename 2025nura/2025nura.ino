@@ -1,7 +1,7 @@
 /* ----------------------------------------------------------------------
     2025 NURA Avionics
     - Avionics Team: K. JunHyeong, K. RangHyeon, K. YongJin, S. SeungMin
-    - Last update: 2025.07.29
+    - PD Based Canard Roll Control
    ---------------------------------------------------------------------- */
 
 #include "EBIMU_AHRS.h"
@@ -15,6 +15,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 
+// 핀 정의
 #define RF_RX 4 // RF RX핀
 #define RF_TX 5 // RF TX핀
 // #define GPS_TX 6 // GPS TX핀
@@ -40,12 +41,13 @@
 #define CH4 3 // Canard 4
 #define CH5 4 // Ejection Servo
 
+// 서보 중립값 파라미터
 #define CANARD1_MID 1480
 #define CANARD2_MID 1440
 #define CANARD3_MID 1520
 #define CANARD4_MID 1540
 
-// #define Kp 0.05 
+// PID 파라미터
 #define Kp 0.2f
 #define Ki 0.0
 #define Kd 0.04f
@@ -53,8 +55,6 @@
 #define M_PI 3.1415926535897932384626433832795
 
 // 객체 생성
-// SoftwareSerial gpsSerial(GPS_RX, GPS_TX);
-// UbxGPS gps(gpsSerial);
 UbxGPS gps(Wire1, GPS_SDA, GPS_SCL); // I2C를 사용한 GPS 객체 생성
 EBIMU_AHRS imu(Serial2, IMU_RX, IMU_TX);
 BMP390L Baro;
@@ -68,7 +68,6 @@ const int SERVO_FREQUENCY = 330;
 const int PWM_RESOLUTION_BITS = 12;
 const uint32_t MAX_DUTY_CYCLE = (1 << PWM_RESOLUTION_BITS) - 1;
 
-// bool sd_init = false;
 bool set_launch_time = false;
 
 struct ControlData_t{
@@ -82,13 +81,12 @@ struct ControlLog_t
     int pwm[4]; // CH1, CH2, CH3, CH4에 대한 PWM 값
 
     ControlLog_t() {
-        pwm[0] = 1500;
-        pwm[1] = 1500;
-        pwm[2] = 1560;
-        pwm[3] = 1530;
+        pwm[0] = 0;
+        pwm[1] = 0;
+        pwm[2] = 0;
+        pwm[3] = 0;
     }
 };
-
 
 struct BlackBoxData_t{
   uint32_t timestamp;
@@ -115,7 +113,6 @@ struct LaunchData_t
     LaunchData_t(): launch_status(0) {}
 };
 
-
 QueueHandle_t ControlQueue;
 QueueHandle_t ControlLogQueue;
 QueueHandle_t BlackBoxQueue;
@@ -133,6 +130,7 @@ void SRG(void *pvParameters);
 // TaskHandle_t task3;
 // TaskHandle_t task4;
 
+// ESP32 PWM 제어를 위한 함수. Servo.h는 ESP32에서 잘 작동하지 않는다..
 void servo_write_us(int channel, int pulse_us) {
     double period_us = 1000000.0 / SERVO_FREQUENCY;
     uint32_t duty = (uint32_t)(((double)pulse_us / period_us) * (double)MAX_DUTY_CYCLE);
@@ -148,9 +146,7 @@ void setup()
     delay(5000);
 
     imu.initialize();
-    rf.print("IMU Ready!");
 
-    // gpsSerial.begin(19200);
     gps.initialize();
     delay(500);
     
@@ -228,9 +224,9 @@ void FlightControl(void *pvParameters)
 
     float setpoint_deg = 0.0f;
     float integral = 0.0f;
-    float previous_error = 0.0f;
-    static float previous_pid = 0.0f;
-    float pid_diff = 0.0f;
+    float P_previous = 0.0f;
+    static float PD_previous = 0.0f;
+    float PD_diff = 0.0f;
 
     static float previous_control_angle = 0.0f;
     static float previous_yaw_deg = 0.0f;
@@ -286,10 +282,9 @@ void FlightControl(void *pvParameters)
             }
 
             if (launch_detected && (millis() - launch_timestamp > 150)) {
-                // 발사가 감지되었고, 그 시점으로부터 1.5초가 지났으면 90도로 변경
+                // 발사 후 0.15초가 지나면 90도로 설정. 발사대 이탈 후 기동하기 위함
                 setpoint_deg = 90.0f;
             } else {
-                // 발사 전이거나, 발사 후 아직 1.5초가 지나지 않았으면 0도를 유지
                 setpoint_deg = 0.0f;
             }
 
@@ -300,69 +295,70 @@ void FlightControl(void *pvParameters)
             }
             last_time = current_time;
 
-            // P 제어
+            // P 제어 //
             float current_yaw_deg = control_data.yaw;
 
-            // 로켓이 한바퀴 이상 회전했을 때 이를 풀어줌. 지속적인 회전 방지.
+            // 로켓이 한바퀴 이상 회전했을 때 이를 누적하고 풀어줌. IMU의 출력은 +-180도 이므로 pole이 발생해 급격한 기동 발생
             float diff = current_yaw_deg - previous_yaw_deg;
-            if (diff > 180.0f) {
+            if (diff > 180.0f) { // +180 경계를 넘어 음수에서 양수로 넘어간 경우
                 revolution_count--;
             }
-            else if (diff < -180.0f) {
+            else if (diff < -180.0f) { // -180 경계를 넘어 양수에서 음수로 넘어간 경우
                 revolution_count++;
             }
 
             unwrapped_yaw_deg = current_yaw_deg + 360.0f * revolution_count;
             previous_yaw_deg = current_yaw_deg;
 
-            float error_deg = setpoint_deg - unwrapped_yaw_deg;
-            float error = error_deg * M_PI / 180.0f;
+            float P_deg = setpoint_deg - unwrapped_yaw_deg;
+            float P_rad = P_deg * M_PI / 180.0f; // 라디안 변환
 
-            // I 제어
-            integral += error * dt;
+            // I 제어 // 현재는 사용하지 않음
+            integral += P_rad * dt;
             integral = constrain(integral, -100, 100); // 파라미터(I 범위) 튜닝 필요. -> PD 제어를 사용하므로 일단 패스
 
-            // D 제어 기본
-            float derivative_raw = (error - previous_error) / dt;
+            // D 제어 //
+            float D_raw = (P_rad - P_previous) / dt;
 
-            // D 제어값 Low-pass filter 적용
+            // D 제어값에 EMA 필터(LPF) 적용
             float alpha = 0.2; // alpha값 튜닝 필요
-            static float previous_derivative_LPF = 0.0;
+            static float D_LPF_previous = 0.0;
 
-            float derivative_LPF = alpha * derivative_raw + (1.0 - alpha) * previous_derivative_LPF;
-            previous_derivative_LPF = derivative_LPF;
+            float D_LPF = alpha * D_raw + (1.0 - alpha) * D_LPF_previous;
+            D_LPF_previous = D_LPF;
 
             // PD 제어
-            float pid_Rad = (Kp * error) + (Kd * derivative_LPF);
+            float PD = (Kp * P_rad) + (Kd * D_LPF);
 
-            pid_diff = (pid_Rad - previous_pid) / dt;
+            PD_diff = (PD - PD_previous) / dt;
 
-            float pid_Rad2;
+            // Slew Limit은 급격한 제어값 변화를 방지하기 위해 제어값의 변화율을 제한한다.
+            float slew_limit;
 
-            if(pid_diff > 7.48)
+            if(PD_diff > 7.48)
             {
-                pid_Rad2 = 7.48 * dt + previous_pid;
+                slew_limit = 7.48 * dt + PD_previous;
             }
-            else if(pid_diff < -7.48)
+            else if(PD_diff < -7.48)
             {
-                pid_Rad2 = -7.48 * dt + previous_pid;
+                slew_limit = -7.48 * dt + PD_previous;
             }
             else
             {
-                pid_Rad2 = pid_Rad;
+                slew_limit = PD;
             }
 
-            previous_pid = pid_Rad2;
+            PD_previous = slew_limit;
 
-            float pid_PWM = pid_Rad2 / 0.09 * 180 / M_PI;
+            float servo_PWM = slew_limit / 0.09 * 180 / M_PI;
 
-            previous_error = error;
+            P_previous = P_rad;
 
-            // 서보 제어값 연산
-            // float control_angle = constrain(pid_PWM, -111, 111); // 약 +- 10도 제한. 1us 당 0.09도 회전이므로, 111us가 최대 회전값
-            // float control_angle = constrain(pid_PWM, -165, 165); // 약 +- 15도 제한 버전
-            float control_angle = constrain(pid_PWM, -333, 333); // 약 +- 30도 제한 버전
-            // float control_angle = constrain(pid_PWM, -500, 500); // 약 +- 45도 제한 버전
+            // 서보 제어값 Saturation
+            // float control_angle = constrain(servo_PWM, -111, 111); // 약 +- 10도 제한. 1us 당 0.09도 회전이므로, 111us가 최대 회전값
+            // float control_angle = constrain(servo_PWM, -165, 165); // 약 +- 15도 제한 버전
+            float control_angle = constrain(servo_PWM, -333, 333); // 약 +- 30도 제한 버전
+            // float control_angle = constrain(servo_PWM, -500, 500); // 약 +- 45도 제한 버전
 
             // control_angle = round(control_angle / 10.0f) * 10.0f; // 10의 배수로 pwm을 넣어줌
 
