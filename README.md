@@ -18,7 +18,7 @@ The objective of this year’s mission is **roll control using four canards**, d
 
 ### System Goals
 - Perform standard launch and recovery sequence  
-- Satisfy and verify research objectives of Konkuk University  
+- PD Based Canard Roll Control 
 
 ### Key Requirements
 1. Maintain stable operation for **at least 30 minutes** after power-up  
